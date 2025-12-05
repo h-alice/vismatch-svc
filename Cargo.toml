@@ -10,7 +10,9 @@ num-traits = "0.2"
 image = "0.24"
 imagehash = "0.3"
 ndarray = "0.17"
-walkdir = "2.5.0"
+walkdir = "2.5"
 bincode = {version = "2", features = ["serde"]}
 serde = {version = "1", features = ["derive"]}
+itertools = "0.14"
+tokio = {version = "1.48", features = ["full"]}
 #img_hash = "3"

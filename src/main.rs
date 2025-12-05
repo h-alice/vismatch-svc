@@ -1,239 +1,178 @@
-use std::cmp::Ordering;
-use std::error::Error;
 
-use imagehash::Hash;
-use serde;
-use image;
-use std::fs::{File, read_dir};
+use std::error::Error;
+use std::sync::Arc;
+use std::time::Instant;
+
+use image::{self, DynamicImage};
+use std::fs::{self, DirEntry, read_dir};
 use std::path::{Path, PathBuf};
-use vismatch_svc::metric::*;
+use vismatch_svc::image_hash::*;
+use itertools::Itertools;
+use std::collections::HashMap;
 
 // Some common ext for images.
 const IMAGE_EXTENSIONS: [&str; 8] = [
-    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff" // We could consider accept top-3 later?
+    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff" // We could consider accept only top-3 later?
 ];
 
-#[derive(serde::Serialize, serde::Deserialize)]
-pub struct HashProxy {
-    /// The bit vector representation of the hash.
-    pub bits: Vec<bool>,
+type ProjectHashDict = HashMap<String, Vec<ImageHashEntry>>;
+
+/// Check if a given file is an image file
+fn is_image_file(file: &DirEntry) -> bool {
+    match file.path().is_file() {
+        false => false,
+        true => {
+            match file.path().extension() {
+                None => false,
+                Some(ext) => {
+                    IMAGE_EXTENSIONS.contains(
+                        &ext.to_string_lossy()
+                            .to_lowercase()
+                            .as_str())
+                },
+            }
+        },
+    }
 }
 
-#[derive(Debug, Clone, Copy)]
-pub enum HashType {
-    DHASH,
-    PHASH,
+/// Calculate project-wide hash from given path.
+fn calc_hash_project(project_path: &Path, hash_type: HashType) -> Result<Vec<ImageHashEntry>, Box<dyn Error>> {
+    let project_dir_reader = 
+        read_dir(project_path)
+            .map_err(|e: std::io::Error| format!("error reading project folder: <{}>", e))?;
+
+    let (images_in_project, _): (Vec<_>, Vec<_>) = 
+        project_dir_reader.filter_ok(|f| is_image_file(f))
+                .map_ok(|f| f.path())
+                .partition_result();
+
+    let (h, _): (Vec<_>, Vec<_>) = images_in_project.into_iter()
+                                    .map(|f| fetch_cache_or_calc_hash(&f, hash_type))
+                                    .partition_result();
+    Ok(h)
 }
 
-/// Write hash value to cache file in the same folder
-/// of image file located.
-fn write_hash_cache(img_path: &Path, img_hash: &Hash, hash_type: HashType) -> Result<usize, Box<dyn Error>> {
+fn load_or_calc_project_hashes(project_path: &Path, hash_type: HashType) 
+    -> Result<Vec<ImageHashEntry>, Box<dyn Error>> {
 
-    let img_path = img_path.to_owned();
-
-    let hash_file_name = match hash_type {
-        HashType::DHASH => img_path.with_added_extension("dhash"),
-        HashType::PHASH => img_path.with_added_extension("phash"),
-    };
-
-    // Serialize: using proxy trick.
-    let hash_pxy = 
-        HashProxy { bits: img_hash.bits.clone() }; // clone to a already-derived (de)serialize struct.
-
-    let mut f_handle = File::create(hash_file_name)?;
-
-    bincode::serde::encode_into_std_write(
-                            &hash_pxy,
-                            &mut f_handle,
-                            bincode::config::standard())
-                                    .map_err(|e| format!("error while serialize ({})", e).into())
-}
-
-
-/// Load hash value from cache in the folder of given image.
-/// 
-pub fn fetch_hash_cache(img_path: &Path, hash_type: HashType) -> Result<Hash, Box<dyn Error>> {
+    let load_now = Instant::now(); // Measure load time
     
-    let hash_file_name = match hash_type {
-        HashType::DHASH => img_path.with_added_extension("dhash"),
-        HashType::PHASH => img_path.with_added_extension("phash"),
-    };
+    // Initial check
+    project_path.is_dir()
+        .then(|| ())
+        .ok_or_else( || 
+            format!("failed to access project path {:?}", project_path))?;
 
-    // try to open the cache corresponding to the given hash type
-    let mut f_handle = match File::open(&hash_file_name) {
-        Ok(f) => f,
-        Err(e) => {
-            // Provide a more descriptive error if the file doesn't exist
-            return Err(format!("cannot open cache file '{}' with type {:?}: {}",
-                                hash_file_name.display(), hash_type, e).into());
-        }
-    };
+    let project_name = 
+        project_path.file_name().ok_or("invalid project name")?;
 
-    // try to decode
-    let hash_pxy: HashProxy = 
-        bincode::serde::decode_from_std_read(
-        &mut f_handle,
-        bincode::config::standard(),
-        ).map_err(|e: bincode::error::DecodeError| format!("cannot deserialize cache file '{}' with type {:?}: {}",
-                            hash_file_name.display(), hash_type, e))?;
+    // NOTE: Change standard hash type if needed.
+    let hash_list: Vec<ImageHashEntry> = 
+        calc_hash_project(project_path, hash_type)?;
 
-    let img_hash = Hash {
-        bits: hash_pxy.bits.clone(),
-    };
+    let load_done = load_now.elapsed(); // Measure load time
 
-    Ok(img_hash)
+    // Verbose
+
+    println!("[*] loading project <{:?}> costs: {:.3?}", project_name, load_done);
+    println!("[v] loaded {} entries from project <{:?}>", hash_list.len(), project_name);
+    
+    Ok(hash_list)
 }
 
-#[derive(Debug)]
-struct HashListEntry {
-    image_name: PathBuf,
-    hash: Hash,
-}
+fn calc_sim_in_project(image: &DynamicImage, project_name: &str, project_hashes: Arc<ProjectHashDict>) 
+    -> Result<Vec<ImageDistEntry>, Box<dyn Error>>{
+    
+    // first, we should check if the project exists.
+    match project_hashes.get(project_name) {
+        Some(hash_list) => {
+            let mut diff_result = calc_similarity_list(image, hash_list);
+            diff_result.sort();
 
-#[derive(Debug)]
-struct HashDistEntry {
-    image_name: PathBuf,
-    distance: f64,
-}
-
-impl PartialEq for HashDistEntry {
-    fn eq(&self, other: &Self) -> bool {
-        // Equality is defined by the total comparison being equal.
-        self.distance.total_cmp(&other.distance) == Ordering::Equal
+            Ok(diff_result)
+        },
+        None => todo!(),
     }
-}
-
-impl Eq for HashDistEntry {}
-
-impl PartialOrd for HashDistEntry {
-    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
-        // You can use standard partial_cmp here, though total_cmp is also fine.
-        self.distance.partial_cmp(&other.distance)
-    }
-}
-
-impl Ord for HashDistEntry {
-    fn cmp(&self, other: &Self) -> Ordering {
-        // Use total_cmp to get a stable, panic-free total ordering.
-        self.distance.total_cmp(&other.distance)
-    }
-}
-
-fn calculate_similarity(img_path: &Path, hash_list: Vec<HashListEntry>) -> Vec<HashDistEntry> {
-    // first, we load the image
-    let img = image::open(img_path).expect("cannot load test image"); // catch error in real implementation
-
-    // choose proper hash algorithm in actual impl
-    let hasher = imagehash::PerceptualHash::new()
-    .with_image_size(32, 32)
-    .with_hash_size(32, 32)
-    .with_resizer(|img, w, h| {
-        // Your custom resizer function
-        img.resize_exact(w as u32, h as u32, image::imageops::FilterType::Lanczos3)
-    });
-
-    let h = hasher.hash(&img);
-
-    hash_list.iter().map(|h_ent| {
-        let h_dist = h.dist(&h_ent.hash);
-
-        HashDistEntry {
-            image_name: h_ent.image_name.clone(),
-            distance: h_dist,    
-        }
-    }).collect()
-
 }
 
 fn main() {
 
-    // Setup hasher
-    let p_hasher = imagehash::PerceptualHash::new()
-    .with_image_size(32, 32)
-    .with_hash_size(32, 32)
-    .with_resizer(|img, w, h| {
-        // Your custom resizer function
-        img.resize_exact(w as u32, h as u32, image::imageops::FilterType::Lanczos3)
-    });
+    // Stage 1: check prerequisites
 
-    let d_hasher = imagehash::DifferenceHash::new()
-    .with_image_size(32, 32)
-    .with_hash_size(32, 32)
-    .with_resizer(|img, w, h| {
-        // Your custom resizer function
-        img.resize_exact(w as u32, h as u32, image::imageops::FilterType::Lanczos3)
-    });
+    let standard_hash_type: HashType = HashType::PHASH;
 
-    let mut hash_entries : Vec<HashListEntry> = Vec::new();
+    let load_all = Instant::now(); // Measure load time
 
-    let root_dir = Path::new("./resources/val2017");
+    let project_root: &Path = Path::new("./image_root");
 
-    let dir_entries = read_dir(root_dir)
-                                    .expect("cannot read folder contents");
+    let is_project_root_exists = 
+        project_root.try_exists()
+                .expect("[x] can't check existence of project root folder, shutting down.");
 
-    // load all dataset and calculate hash
-    for ent in dir_entries {
-        let ent = match ent {
-            Ok(ent) => ent,
-            Err(e) => {
-                println!("Error encounted while reading content: {}", e);
-                continue;
+    match is_project_root_exists {
+        false => {
+            match fs::create_dir(project_root) {
+                Ok(_) => println!("[*] created project root folder."),
+                Err(_) => panic!("[x] cannot create project folder, shutting down."),
             }
-        };
-
-        let img_path = ent.path();
-        
-        // Skip directories and non-files
-        if !img_path.is_file() {
-            continue;
-        }
-
-        // Check image extencsion
-        let is_image = img_path.extension()
-            .and_then(|ext| ext.to_str())
-            .map(|ext| IMAGE_EXTENSIONS.contains(&ext.to_lowercase().as_str()))
-            .unwrap_or(false);
-
-        if is_image {
-            // try to load cache first
-            match fetch_hash_cache(&img_path, HashType::PHASH) { // We use phash for this experiement
-                Ok(h) => {
-                    hash_entries.push(HashListEntry { image_name: img_path.to_owned(), hash: h });
-                    continue;
-                },
-                Err(_e) => {
-                    println!("new image found, calculating new hash cache: {:?}", img_path);
-                },
-            }
-
-            match image::open(img_path.clone()) {
-                Err(e) => println!("cannot open img <{}> due to: {}", img_path.display(), e),
-                Ok(img) => {
-                    let p_hash = p_hasher.hash(&img);
-                    let d_hash = d_hasher.hash(&img);
-                    println!("{} => {:?}", img_path.display(), p_hash);
-
-                    // Serialize to cache file
-                    write_hash_cache(&img_path, &p_hash, HashType::PHASH)
-                        .map_err(|err| println!("error while serializing to file: {}", err))
-                        .ok();
-                    
-                    write_hash_cache(&img_path, &d_hash, HashType::DHASH)
-                        .map_err(|err| println!("error while serializing to file: {}", err))
-                        .ok();
-
-
-                    println!("Successfully calculated hash for image: {:?}", img_path);
-                    hash_entries.push(HashListEntry { image_name: img_path.to_owned(), hash: p_hash }); // we use phash only for this time
-                }
+        },
+        true => {
+            match project_root.is_dir() {
+                false => panic!("[x] project folderis not valid, shutting down."),
+                true => {}, // Do nothing, continue the service process
             }
         }
     }
 
-    let test_img_path = PathBuf::from("./test4.jpg");
+    // Stage 2: load or calculate hash for children projects
 
-    let mut compared_res = calculate_similarity(&test_img_path, hash_entries);
-    compared_res.sort(); // inplace sort
+    let child_project_reader = 
+        read_dir(project_root)
+            .map_err(|e: std::io::Error| format!("error reading root project contents: <{}>", e))
+            .unwrap(); // [Panics] Terminates process if cannot access project root.
+
+    let (children_projects, _): (Vec<_>, Vec<_>) = 
+        child_project_reader.filter_ok(|f| f.path().is_dir())
+                .map_ok(|f| f.path())
+                .partition_result();
+
+
+    // Load and create a list of tuple (project name, [hash entries])
+    let (children_project_hashes, _): 
+        (Vec<(String, Vec<ImageHashEntry>)>, Vec<_>) = 
+            children_projects.into_iter()
+                .map(|f: PathBuf| {
+                    match load_or_calc_project_hashes(&f, standard_hash_type) {
+                        Ok(h) => {
+                            let project_name = 
+                                f.file_name().ok_or("invalid project name")?;
+                            Ok((project_name.to_string_lossy().into_owned(), h))
+                        },
+                        Err(err) => Err(err),
+                    }})
+                .partition_result();
+
+    // Create a Arc to wrap shared project hashes.
+    let project_name_hash_map: Arc<ProjectHashDict>
+            = Arc::new(children_project_hashes.into_iter().collect());
+
+    let load_all_done = load_all.elapsed(); // Measure load time
+
+    // [NOTE] any other init stage thingy goes here.
+
+    println!("[*] initialization stage costs: {:.3?}", load_all_done);
+    println!("[v] initialization stage done, strating service...");
+
+
+
+    let test_img_path = PathBuf::from("./resources/test_images/test4.jpg");
+    let test_img = image::open(test_img_path.clone()).unwrap();
+    
+    let compared_res = calc_sim_in_project(
+        &test_img, 
+        "val2017", 
+        project_name_hash_map).expect("cannot calculate image distance");
+
 
     let top3 = &compared_res[0..3];
 
