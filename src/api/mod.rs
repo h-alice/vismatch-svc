@@ -8,30 +8,30 @@ pub struct SimilarImageEntry {
 }
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct CompareImageReq {
-	project_name: String,
-	data: String,
+	pub project_name: String,
+	pub data: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
 pub struct CompareImageResp {
-	success: bool,
-	message: String,
-	project_name: String, // the name of project
-	compare_result: Vec<SimilarImageEntry>,
+	pub success: bool,
+	pub message: String,
+	pub project_name: String, // the name of project
+	pub compare_result: Vec<SimilarImageEntry>,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct UploadImageReq {
-	project_name: String,
-	data: String,
-	with_image: bool,
+	pub project_name: String,
+	pub data: String,
+	pub with_image: bool,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct UploadImageResp {
-	success: bool,
-	message: String,
-	token: String,
+	pub success: bool,
+	pub message: String,
+	pub token: String,
 }
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
@@ -57,7 +57,6 @@ mod tests {
         let smallest_png_1: String = 
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQYGWNgYGD4DwABBAEAqXIB5QAAAABJRU5ErkJggg".to_owned();
 
-        // 1x1 GIF
         let smallest_png_2: String = 
             "R0lGODlhAQABAIAAAAAAAP///yH5BAAAAAAALAAAAAABAAEAAAICRAEAOw".to_owned();
 
