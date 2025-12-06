@@ -57,7 +57,7 @@ mod tests {
         let smallest_png_1: String = 
             "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVQYGWNgYGD4DwABBAEAqXIB5QAAAABJRU5ErkJggg".to_owned();
 
-        let smallest_png_2: String = 
+        let smallest_gif_2: String = 
             "R0lGODlhAQABAIAAAAAAAP///yH5BAAAAAAALAAAAAABAAEAAAICRAEAOw".to_owned();
 
         // ---------------------------------------------------------
@@ -91,7 +91,7 @@ mod tests {
         println!("--- Testing CompareImageReq ---");
         let comp_req: CompareImageReq = CompareImageReq {
             project_name: "some_project".to_owned(),
-            data: smallest_png_2.clone(),
+            data: smallest_gif_2.clone(),
         };
 
         let comp_req_json: String = serde_json::to_string_pretty(&comp_req).unwrap();
