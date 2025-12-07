@@ -318,7 +318,7 @@ async fn main() {
     println!("[*] initialization stage costs: {:.3?}", load_all_done);
     println!("[v] initialization stage done, strating service...");
 
-    let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3000));
+    let addr: SocketAddr = SocketAddr::from(([0, 0, 0, 0], 3000));
 
     let listener: TcpListener = 
         TcpListener::bind(addr).await.unwrap();
