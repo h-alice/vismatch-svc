@@ -2,35 +2,18 @@ pub mod api;
 pub mod vec_ops;
 pub mod metric;
 pub mod image_hash;
+pub mod project_mgmt;
+mod utils;
 
-use std::fs::DirEntry;  // filesystem utils
+pub use utils::is_image_file;
+
+
 use api::*;
 use image::DynamicImage;
 
-// Some common ext for images.
-const IMAGE_EXTENSIONS: [&str; 8] = [
-    "png", "jpg", "jpeg", "gif", "bmp", "ico", "webp", "tiff" // We could consider accept only top-3 later?
-];
+use crate::image_hash::ImageDistEntry;
 
-/// Check if a given file is an image file
-pub fn is_image_file(file: &DirEntry) -> bool {
-    match file.path().is_file() {
-        false => false,
-        true => {
-            match file.path().extension() {
-                None => false,
-                Some(ext) => {
-                    IMAGE_EXTENSIONS.contains(
-                        &ext.to_string_lossy()
-                            .to_lowercase()
-                            .as_str())
-                },
-            }
-        },
-    }
-}
-
-fn base64_to_image(base64_str: &str) 
+pub fn base64_to_image(base64_str: &str) 
     -> Result<image::DynamicImage, Box<dyn std::error::Error>> {
     
     use base64::{engine::general_purpose, Engine};
@@ -90,6 +73,35 @@ impl HasSingleImage for CompareImageReq {
         base64_to_image(&self.data)
     }
 }
+
+/// Convert a`ImageDistEntry` to `SimilarImageEntry`.
+pub fn dist_entry_to_api_sim_entry(dist: &ImageDistEntry, with_image: bool)
+    -> SimilarImageEntry {
+
+    let image_data = match with_image {
+        false => None,
+        true => {
+            image::open(dist.image_name.clone())
+                .map_err(|e| e.into()) 
+                .and_then(|image: DynamicImage| image_to_base64(&image))
+                .ok()
+        },
+    };
+
+    let image_full_name = dist.image_name.clone();
+
+    let image_name = match image_full_name.file_name() {
+        None => "".to_owned(),
+        Some(f) => f.to_string_lossy().into_owned(),
+    };
+
+    SimilarImageEntry { 
+        image_name, 
+        distance: dist.distance as f32, 
+        data: image_data }
+}
+
+
 
 #[cfg(test)]
 mod tests {

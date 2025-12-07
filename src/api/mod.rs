@@ -1,3 +1,6 @@
+mod api_error;
+pub use api_error::*;
+
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq)]
@@ -24,6 +27,7 @@ pub struct CompareImageResp {
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq)]
 pub struct UploadImageReq {
 	pub project_name: String,
+    pub image_name: String,
 	pub data: String,
 }
 
@@ -107,6 +111,7 @@ mod tests {
         println!("--- Testing UploadImageReq ---");
         let upload_req: UploadImageReq = UploadImageReq {
             project_name: "some_project".to_owned(),
+            image_name: "test.png".to_owned(),
             data: smallest_png_1.clone(),
         };
 
@@ -166,3 +171,5 @@ mod tests {
         assert_eq!(remove_resp, remove_resp_deserialized);
     }
 }
+
+

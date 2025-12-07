@@ -1,66 +1,123 @@
 
-use std::time::{Duration, Instant};              // calculate time difference
-use std::error::Error;               // standard error trait
-use image::DynamicImage;             // image IO
-use itertools::Itertools;            // functional pattern support for clean code
-use std::collections::HashMap;       // hashmap support
-use std::sync::Arc;                  // shared object reference
+use std::cmp::min;
+use std::error::Error;          // standard error trait
+use std::time::Instant;         // calculate time difference
+use std::collections::HashMap;  // hashmap support
+use image::DynamicImage;        // image IO
+use itertools::Itertools;       // functional pattern support to make life easier
+
+// asynchronous execution and management
+use tokio::sync::RwLock;    // shared object management
+use std::sync::Arc;         // shared object reference
+
+// HTTP related libs
+use axum::http::{Response, StatusCode}; // HTTP
+use axum::response::IntoResponse;       // convert to response
+use axum::routing::{post};              // HTTP method
+use axum::body::Body;                   // plain response body
+use axum::extract::{Json, State};       // response types
+use axum::{Router, http};               // router
+use tokio::net::TcpListener;            // listener
+use std::net::SocketAddr;               // socker definition
+
+// filesystem and os-related libraries
 use std::path::{Path, PathBuf};      // filesystem path operations
 use std::fs::{read_dir, create_dir}; // filesystem utils
-use vismatch_svc::image_hash::*;     // our packaged hash algorithms
+
+// internal libraries
 use vismatch_svc::{
-    is_image_file,
+    HasSingleImage,         // trait for getting image from request object
+    base64_to_image, 
+    dist_entry_to_api_sim_entry, image_hash::*};     // our packaged hash algorithms
+
+use vismatch_svc::project_mgmt::{
+    load_or_calc_project_hashes     
 };
-use tokio::sync::RwLock;
+use vismatch_svc::api::*;           // API structure
+
+
 type ProjectHashDict = Arc<RwLock<HashMap<String, Vec<ImageHashEntry>>>>;
 
-
-/// Calculate project-wide hash from given path.
-fn calc_hash_project(project_path: &Path, hash_type: HashType) -> Result<Vec<ImageHashEntry>, Box<dyn Error>> {
-    let project_dir_reader = 
-        read_dir(project_path)
-            .map_err(|e: std::io::Error| format!("error reading project folder: <{}>", e))?;
-
-    let (images_in_project, _): (Vec<_>, Vec<_>) = 
-        project_dir_reader.filter_ok(|f| is_image_file(f))
-                .map_ok(|f| f.path())
-                .partition_result();
-
-    let (h, _): (Vec<_>, Vec<_>) = images_in_project.into_iter()
-                                    .map(|f| fetch_cache_or_calc_hash(&f, hash_type))
-                                    .partition_result();
-    Ok(h)
+#[derive(Clone)]
+struct AppState {
+    project_root: String,
+    project_dict: ProjectHashDict,
 }
 
-/// For all images in project folder, try to load hash cache,
-/// and calculate if not found hash cache.
-fn load_or_calc_project_hashes(project_path: &Path, hash_type: HashType) 
-    -> Result<Vec<ImageHashEntry>, Box<dyn Error>> {
+// common task definition
 
-    let load_now = Instant::now(); // Measure load time
-    
-    // Initial check
-    project_path.is_dir()
-        .then(|| ())
-        .ok_or_else( || 
-            format!("failed to access project path {:?}", project_path))?;
 
-    let project_name = 
-        project_path.file_name().ok_or("invalid project name")?;
+async fn save_image_to_project(
+    project_root: &str,
+    project_name: &str, 
+    image: &DynamicImage, 
+    image_name: &str,
+    hash_type: HashType,
+    project_hashes: ProjectHashDict) -> Result<(), Box<dyn Error + Send + Sync>> {
 
-    // NOTE: Change standard hash type if needed.
-    let hash_list: Vec<ImageHashEntry> = 
-        calc_hash_project(project_path, hash_type)?;
+    let project_root = Path::new(project_root);
+    let project_path = &project_root.join(project_name);
 
-    let load_done = load_now.elapsed(); // Measure load time
+    let _project_hashes = Arc::clone(&project_hashes);
+    let mut project_dict_wlock = _project_hashes.write().await;
 
-    // Verbose
+    // check project dir
+    match project_path.is_dir() {
+        false => {
+            // create project folder
+            create_dir(project_path)
+                .map_err(|e| format!("cannot create project folder: {}", e.to_string()))?;
 
-    println!("[*] loading project <{:?}> costs: {:.3?}", project_name, load_done);
-    println!("[v] loaded {} entries from project <{:?}>", hash_list.len(), project_name);
-    
-    Ok(hash_list)
+            // create entry for our new project.
+            (*project_dict_wlock).insert(project_name.to_owned(), Vec::<ImageHashEntry>::new());
+        }
+        true => {} // continue execution
+    }
+
+    // now add image name
+    let image_target_path = project_path.join(image_name);
+
+    // [NOTE] verbose print
+    println!("[*] saving image to <{}>", image_target_path.to_string_lossy());
+
+    // save the image
+    image.save(&image_target_path)
+        .map_err(|e: image::ImageError| 
+            Box::<dyn std::error::Error + Send + Sync>::from(   // I know it's tricky, but we need to cast the error
+                format!("error while saving image: {}", e.to_string())))?;
+
+    // now we need to calculate, and update the global hash dict.
+    // we clone this, since it will be moved to other thread
+    let _image_target_path = image_target_path.clone();
+
+    // we spawn a task to calculate hash.
+    let hash_calc_task = 
+        tokio::task::spawn_blocking(move || {    
+            let image_target_path = _image_target_path;
+
+            // we need type annotation, so we created a new varibale here to hold result.
+            let res: Result<ImageHashEntry, Box<dyn Error + Send + Sync>> = 
+                fetch_cache_or_calc_hash(
+                    &image_target_path, 
+                    hash_type,
+                    true)
+                    .map_err(|f|f.to_string().into());  
+            res // return the result
+        });
+
+    let hash_result: ImageHashEntry = hash_calc_task.await??; // now we have the calculated hash.
+
+    // now we can update the project hash dict.
+    let project_name = project_name;
+
+    if let Some(val) = 
+        (*project_dict_wlock).get_mut(project_name) { 
+            val.push(hash_result); 
+    }
+
+    Ok(()) // All good, return
 }
+
 
 /// For a given image and specified project name, calculate
 /// the difference list across project images for provided image.
@@ -101,6 +158,95 @@ async fn calc_sim_in_project(image: DynamicImage, project_name: &str, project_ha
         },
         None => Err(format!("project <{}> not found in current database", project_name).into()),
     }
+}
+
+// here's are the service handlers
+
+async fn compare_handler(
+    State(state): State<AppState>, 
+    Json(payload): Json<CompareImageReq>)
+    -> Result<Json<CompareImageResp>, AppError> {
+    
+    // 1. we first get the image from data b64 string
+    let image_target 
+        = payload.get_image()
+            .map_err(|e| AppError::InternalError(e.to_string()))?;
+
+    // 2. 
+    let result = calc_sim_in_project(
+        image_target, 
+        &payload.project_name, 
+        state.project_dict
+    ).await.map_err(|e| AppError::BadRequest(e.to_string()));
+
+    match result {
+        Ok(dist_vec) => {
+
+            // [NOTE] we pick the top-3 entries from closest images, change if needed.
+            let ending_index = min(dist_vec.len(), 3);
+            let sim_vec: Vec<SimilarImageEntry> = (&dist_vec[0..ending_index])
+                .iter().map(
+                    |x| dist_entry_to_api_sim_entry(
+                        x, 
+                        payload.with_image))
+                .collect();
+            
+            Ok(Json(CompareImageResp {
+            success: true,
+            message: "success".to_owned(),
+            project_name: payload.project_name,
+            compare_result: sim_vec,
+        }))},
+        Err(e) => Err(e),
+    }
+}
+
+async fn upload_handler(
+    State(state): State<AppState>, 
+    Json(payload): Json<UploadImageReq>)
+    -> Result<Json<UploadImageResp>, AppError> {
+    
+    // 1. we first collect parameters we need
+
+    let project_root = state.project_root;
+    let project_name = payload.project_name;
+    let image_name = payload.image_name;
+
+    // [NOTE] conside resize to save spaces.
+    let image = base64_to_image(&payload.data)
+                .map_err(|e| format!("cannot create image from b64: {}", e.to_string()))
+                .map_err(|e| AppError::BadRequest(e.to_string()))?;
+    let project_dict = Arc::clone(&state.project_dict);
+    
+
+    println!("[*] received upload request on <{}>", project_name); // [NOTE] verbose
+
+    // do saving image, return 500 if failed
+    save_image_to_project(
+        &project_root,
+        &project_name,
+        &image,
+        &image_name,
+        HashType::PHASH, // [NOTE] [WARN] change here later
+        project_dict
+    ).await.map_err(|e| AppError::InternalError(e.to_string()))?;
+
+    Ok(Json(UploadImageResp {
+        success: true,
+        message: "image uploaded and indexed successfully".to_owned(),
+        token: "dummy-deletion-token".to_string(), // [WARN] [NOTE] change later to proper uuid
+    }))
+
+}
+
+
+/// Handler for "404 not found" error, returning plain text body.
+async fn not_found_handler() -> Response<Body> { 
+    (
+        StatusCode::NOT_FOUND,
+        [(http::header::CONTENT_TYPE, "application/json")],
+        "Knock, knock. Anyone here?\n\nSorry, this door seems to be missing! Maybe try another link?".to_owned()
+    ).into_response()
 }
 
 #[tokio::main]
@@ -172,50 +318,26 @@ async fn main() {
     println!("[*] initialization stage costs: {:.3?}", load_all_done);
     println!("[v] initialization stage done, strating service...");
 
+    let addr: SocketAddr = SocketAddr::from(([127, 0, 0, 1], 3000));
 
-    let test_img_path = PathBuf::from("./resources/test_images/test4.jpg");
-    let test_img = image::open(test_img_path.clone()).unwrap();
-    
-    let mut task_set: tokio::task::JoinSet<Result<Vec<ImageDistEntry>, 
-                        Box<dyn Error + Send + Sync + 'static>>> 
-        = tokio::task::JoinSet::new();
+    let listener: TcpListener = 
+        TcpListener::bind(addr).await.unwrap();
 
-    let task_start = Instant::now(); // Measure load time       
+    println!("[*] image comparison service listening on {}", addr);
 
-    for _ in 0..5 { // spawn 5 comparison tasks on same image for concurrency test
-        task_set.spawn(calc_sim_in_project(
-            test_img.clone(),
-            "val2017",
-            Arc::clone(&project_name_hash_map))
-        );
-    }
 
-    let all_result 
-        = task_set.join_all().await;
+    // Stage 3: starting service
+    let axum_state: AppState = AppState { 
+        project_root: project_root.to_string_lossy().to_string(),
+        project_dict: project_name_hash_map };
 
-    let (res, failed): (Vec<_>, Vec<_>) 
-        = all_result.into_iter().partition_result(); // If any sub-task failed, just ignore.
+    let axum_app: Router = Router::new()
+                    .route("/diff", post(compare_handler))
+                    .route("/upload", post(upload_handler))
+                    .with_state(axum_state)
+                    .fallback(not_found_handler);
 
-    let task_end = task_start.elapsed(); // Measure compute time  
-
-    println!("[*] calculation costs: {:.3?}", task_end);
-
-    match res.len() > 0 {
-        false => {
-            panic!("all subtask failed! check first message: {}", (&failed[0]).to_string())
-        },
-        true => {
-            let compared_res = &res[0]; // pick the first result
-
-            let top3 = &compared_res[0..3];
-
-            println!("===Top 3 results===");
-
-            top3.iter().for_each(|elem| {
-                println!("image name: {:?} | score: {}", elem.image_name, elem.distance);
-            });
-        },
-    }
+    axum::serve(listener, axum_app).await.unwrap();
 }
 
 
